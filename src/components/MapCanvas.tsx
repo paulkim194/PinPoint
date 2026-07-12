@@ -1,0 +1,216 @@
+import { forwardRef, useImperativeHandle, useState } from 'react';
+import { Image, StyleSheet, View, type LayoutChangeEvent } from 'react-native';
+import { Gesture, GestureDetector } from 'react-native-gesture-handler';
+import Animated, {
+  runOnJS,
+  useAnimatedStyle,
+  useSharedValue,
+  withTiming,
+} from 'react-native-reanimated';
+
+import PinMarker from './PinMarker';
+import type { Landmark } from '../types';
+
+const MIN_SCALE = 1;
+const MAX_SCALE = 6;
+const SEARCH_FOCUS_SCALE = 2.5;
+
+export interface MapCanvasHandle {
+  /** Animates zoom/pan so the given intrinsic pixel position is centered in the viewport. */
+  centerOnPixel: (pixelX: number, pixelY: number) => void;
+}
+
+interface MapCanvasProps {
+  imageUri: string;
+  imageWidth: number;
+  imageHeight: number;
+  landmarks: Landmark[];
+  highlightedLandmarkId: string | null;
+  pulseNonce: number;
+  movingLandmarkId: string | null;
+  onLongPress: (pixelX: number, pixelY: number) => void;
+  onPinPress: (landmark: Landmark) => void;
+  onPinMoved: (landmarkId: string, pixelX: number, pixelY: number) => void;
+}
+
+function MapCanvas(
+  {
+    imageUri,
+    imageWidth,
+    imageHeight,
+    landmarks,
+    highlightedLandmarkId,
+    pulseNonce,
+    movingLandmarkId,
+    onLongPress,
+    onPinPress,
+    onPinMoved,
+  }: MapCanvasProps,
+  ref: React.Ref<MapCanvasHandle>
+) {
+  const [viewport, setViewport] = useState({ width: 0, height: 0 });
+
+  const scale = useSharedValue(1);
+  const translateX = useSharedValue(0);
+  const translateY = useSharedValue(0);
+  const savedScale = useSharedValue(1);
+  const savedTranslateX = useSharedValue(0);
+  const savedTranslateY = useSharedValue(0);
+
+  const handleLayout = (e: LayoutChangeEvent) => {
+    const { width, height } = e.nativeEvent.layout;
+    if (width === viewport.width && height === viewport.height) return;
+    setViewport({ width, height });
+  };
+
+  const baseScale = viewport.width > 0 ? viewport.width / imageWidth : 0;
+  const baseWidth = viewport.width;
+  const baseHeight = baseScale > 0 ? imageHeight * baseScale : 0;
+  const ready = baseWidth > 0 && baseHeight > 0 && viewport.height > 0;
+
+  // Re-center whenever a new image/viewport size is known (first load, or an
+  // orientation change). Only meaningful once we've actually measured layout.
+  const [centeredKey, setCenteredKey] = useState('');
+  const layoutKey = `${imageUri}:${viewport.width}:${viewport.height}`;
+  if (ready && centeredKey !== layoutKey) {
+    scale.value = 1;
+    translateX.value = 0;
+    translateY.value = baseHeight <= viewport.height ? (viewport.height - baseHeight) / 2 : 0;
+    savedScale.value = 1;
+    savedTranslateX.value = translateX.value;
+    savedTranslateY.value = translateY.value;
+    setCenteredKey(layoutKey);
+  }
+
+  const pan = Gesture.Pan()
+    .onStart(() => {
+      savedTranslateX.value = translateX.value;
+      savedTranslateY.value = translateY.value;
+    })
+    .onUpdate((e) => {
+      const s = scale.value;
+      const scaledWidth = baseWidth * s;
+      const scaledHeight = baseHeight * s;
+      const minX = Math.min(0, viewport.width - scaledWidth);
+      const minY = Math.min(0, viewport.height - scaledHeight);
+      const rawX = savedTranslateX.value + e.translationX;
+      const rawY = savedTranslateY.value + e.translationY;
+      translateX.value = Math.min(Math.max(rawX, minX), 0);
+      translateY.value =
+        scaledHeight <= viewport.height ? (viewport.height - scaledHeight) / 2 : Math.min(Math.max(rawY, minY), 0);
+    });
+
+  const pinch = Gesture.Pinch()
+    .onStart(() => {
+      savedScale.value = scale.value;
+      savedTranslateX.value = translateX.value;
+      savedTranslateY.value = translateY.value;
+    })
+    .onUpdate((e) => {
+      const newScale = Math.min(Math.max(savedScale.value * e.scale, MIN_SCALE), MAX_SCALE);
+      const rawX = e.focalX - (e.focalX - savedTranslateX.value) * (newScale / savedScale.value);
+      const rawY = e.focalY - (e.focalY - savedTranslateY.value) * (newScale / savedScale.value);
+
+      const scaledWidth = baseWidth * newScale;
+      const scaledHeight = baseHeight * newScale;
+      const minX = Math.min(0, viewport.width - scaledWidth);
+      const minY = Math.min(0, viewport.height - scaledHeight);
+
+      scale.value = newScale;
+      translateX.value = Math.min(Math.max(rawX, minX), 0);
+      translateY.value =
+        scaledHeight <= viewport.height ? (viewport.height - scaledHeight) / 2 : Math.min(Math.max(rawY, minY), 0);
+    });
+
+  const handleLongPressJs = (pixelX: number, pixelY: number) => {
+    onLongPress(pixelX, pixelY);
+  };
+
+  const longPress = Gesture.LongPress()
+    .minDuration(450)
+    .maxDistance(12)
+    .onStart((e) => {
+      'worklet';
+      const baseX = (e.x - translateX.value) / scale.value;
+      const baseY = (e.y - translateY.value) / scale.value;
+      const pixelX = baseX / baseScale;
+      const pixelY = baseY / baseScale;
+      runOnJS(handleLongPressJs)(pixelX, pixelY);
+    });
+
+  const composedGesture = Gesture.Exclusive(longPress, Gesture.Simultaneous(pan, pinch));
+
+  const transformStyle = useAnimatedStyle(() => ({
+    transform: [
+      { translateX: translateX.value },
+      { translateY: translateY.value },
+      { scale: scale.value },
+    ],
+  }));
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      centerOnPixel: (pixelX: number, pixelY: number) => {
+        if (!ready) return;
+        const targetScale = Math.max(scale.value, SEARCH_FOCUS_SCALE);
+        const bx = pixelX * baseScale;
+        const by = pixelY * baseScale;
+        const scaledWidth = baseWidth * targetScale;
+        const scaledHeight = baseHeight * targetScale;
+        const minX = Math.min(0, viewport.width - scaledWidth);
+        const minY = Math.min(0, viewport.height - scaledHeight);
+
+        const rawX = viewport.width / 2 - bx * targetScale;
+        const rawY = viewport.height / 2 - by * targetScale;
+
+        const targetX = Math.min(Math.max(rawX, minX), 0);
+        const targetY =
+          scaledHeight <= viewport.height ? (viewport.height - scaledHeight) / 2 : Math.min(Math.max(rawY, minY), 0);
+
+        scale.value = withTiming(targetScale, { duration: 450 });
+        translateX.value = withTiming(targetX, { duration: 450 });
+        translateY.value = withTiming(targetY, { duration: 450 });
+      },
+    }),
+    [ready, baseScale, baseWidth, baseHeight, viewport.width, viewport.height]
+  );
+
+  return (
+    <View style={styles.fill} onLayout={handleLayout}>
+      {ready && (
+        <GestureDetector gesture={composedGesture}>
+          <View style={styles.fill}>
+            <Animated.View style={[styles.transformer, transformStyle]}>
+              <Image
+                source={{ uri: imageUri }}
+                style={{ width: baseWidth, height: baseHeight }}
+                resizeMode="stretch"
+              />
+              {landmarks.map((landmark) => (
+                <PinMarker
+                  key={landmark.id}
+                  landmark={landmark}
+                  baseScale={baseScale}
+                  highlighted={highlightedLandmarkId === landmark.id}
+                  pulseNonce={pulseNonce}
+                  isMoving={movingLandmarkId === landmark.id}
+                  mapScale={scale}
+                  onPress={() => onPinPress(landmark)}
+                  onMoveEnd={(pixelX, pixelY) => onPinMoved(landmark.id, pixelX, pixelY)}
+                />
+              ))}
+            </Animated.View>
+          </View>
+        </GestureDetector>
+      )}
+    </View>
+  );
+}
+
+export default forwardRef(MapCanvas);
+
+const styles = StyleSheet.create({
+  fill: { flex: 1, overflow: 'hidden', backgroundColor: '#000' },
+  transformer: { position: 'absolute', left: 0, top: 0 },
+});
