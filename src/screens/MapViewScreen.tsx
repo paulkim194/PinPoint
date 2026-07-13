@@ -5,19 +5,24 @@ import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import AddLandmarkModal from '../components/AddLandmarkModal';
+import CalibrationWizard from '../components/CalibrationWizard';
 import MapCanvas, { type MapCanvasHandle } from '../components/MapCanvas';
 import PinActionSheet from '../components/PinActionSheet';
 import SearchBar from '../components/SearchBar';
+import { bearingAndDistance } from '../services/geo';
+import { captureAveragedPosition, requestForegroundPermission } from '../services/location';
 import { createLandmarkIndex, searchLandmarks } from '../services/search';
 import { storage } from '../services/storage';
 import { generateId } from '../utils/id';
-import type { FestivalMap, Landmark, LandmarkCategory } from '../types';
+import type { Calibration, CalibrationAnchor, FestivalMap, Landmark, LandmarkCategory } from '../types';
 import type { RootStackParamList } from '../navigation/types';
 
 type Nav = NativeStackNavigationProp<RootStackParamList, 'MapView'>;
 type Rt = RouteProp<RootStackParamList, 'MapView'>;
 
 type ModalState = { kind: 'add'; pixelX: number; pixelY: number } | { kind: 'edit'; landmark: Landmark } | null;
+
+const MIN_ANCHOR_DISTANCE_M = 50;
 
 export default function MapViewScreen() {
   const navigation = useNavigation<Nav>();
@@ -35,6 +40,13 @@ export default function MapViewScreen() {
   const [modalState, setModalState] = useState<ModalState>(null);
   const [actionSheetLandmark, setActionSheetLandmark] = useState<Landmark | null>(null);
   const [movingLandmarkId, setMovingLandmarkId] = useState<string | null>(null);
+
+  const [calibrating, setCalibrating] = useState(false);
+  const [calibrationStep, setCalibrationStep] = useState<1 | 2>(1);
+  const [stepLandmark, setStepLandmark] = useState<Landmark | null>(null);
+  const [anchor1, setAnchor1] = useState<CalibrationAnchor | null>(null);
+  const [anchor1LandmarkId, setAnchor1LandmarkId] = useState<string | null>(null);
+  const [capturingGps, setCapturingGps] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -54,6 +66,7 @@ export default function MapViewScreen() {
   const searchResults = useMemo(() => searchLandmarks(fuseIndex, searchQuery), [fuseIndex, searchQuery]);
 
   const handleLongPress = (pixelX: number, pixelY: number) => {
+    if (calibrating) return;
     setModalState({ kind: 'add', pixelX, pixelY });
   };
 
@@ -114,16 +127,142 @@ export default function MapViewScreen() {
     canvasRef.current?.centerOnPixel(landmark.pixelX, landmark.pixelY);
   };
 
+  // ---- Calibration ----
+
+  const startCalibration = () => {
+    if (!map || map.landmarks.length < 2) {
+      Alert.alert('Pin more landmarks first', 'You need at least 2 landmarks pinned on this map before you can calibrate it.');
+      return;
+    }
+    setCalibrating(true);
+    setCalibrationStep(1);
+    setStepLandmark(null);
+    setAnchor1(null);
+    setAnchor1LandmarkId(null);
+    setHighlightedLandmarkId(null);
+  };
+
+  const handleCalibrateButtonPress = () => {
+    if (map?.calibration) {
+      Alert.alert('Re-calibrate this map?', 'This replaces the existing calibration.', [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Re-calibrate', onPress: startCalibration },
+      ]);
+    } else {
+      startCalibration();
+    }
+  };
+
+  const exitCalibration = () => {
+    setCalibrating(false);
+    setCalibrationStep(1);
+    setStepLandmark(null);
+    setAnchor1(null);
+    setAnchor1LandmarkId(null);
+    setHighlightedLandmarkId(null);
+  };
+
+  const handleCalibrationPinSelect = (landmark: Landmark) => {
+    if (calibrationStep === 2 && landmark.id === anchor1LandmarkId) {
+      Alert.alert('Pick a different landmark', "That's the one you already used for point 1 — choose a different, ideally farther-away landmark.");
+      return;
+    }
+    setStepLandmark(landmark);
+    setHighlightedLandmarkId(landmark.id);
+    setPulseNonce((n) => n + 1);
+  };
+
+  const saveCalibration = async (a1: CalibrationAnchor, a2: CalibrationAnchor) => {
+    if (!map) return;
+    const calibration: Calibration = { anchors: [a1, a2] };
+    const updated = await storage.setCalibration(map.id, calibration);
+    setMap(updated);
+    exitCalibration();
+  };
+
+  const finishCalibration = (a1: CalibrationAnchor, a2: CalibrationAnchor) => {
+    const { distanceM } = bearingAndDistance({ lat: a1.lat, lng: a1.lng }, { lat: a2.lat, lng: a2.lng });
+    if (distanceM < MIN_ANCHOR_DISTANCE_M) {
+      Alert.alert(
+        'Points are close together',
+        `Your two calibration points are only about ${Math.round(distanceM)}m apart. For accurate results, pick landmarks at least ${MIN_ANCHOR_DISTANCE_M}m apart if you can.`,
+        [
+          {
+            text: 'Redo point 2',
+            style: 'cancel',
+            onPress: () => {
+              setStepLandmark(null);
+              setHighlightedLandmarkId(null);
+            },
+          },
+          { text: 'Use anyway', onPress: () => saveCalibration(a1, a2) },
+        ]
+      );
+      return;
+    }
+    saveCalibration(a1, a2);
+  };
+
+  const handleCapture = async () => {
+    if (!stepLandmark || capturingGps) return;
+    setCapturingGps(true);
+    try {
+      const granted = await requestForegroundPermission();
+      if (!granted) {
+        Alert.alert(
+          'Location permission needed',
+          "PinPoint needs location access to calibrate this map. Everything else works fine without it -- you can enable it later in Settings if you change your mind."
+        );
+        return;
+      }
+
+      const fix = await captureAveragedPosition();
+      const anchor: CalibrationAnchor = {
+        lat: fix.lat,
+        lng: fix.lng,
+        accuracyM: fix.accuracyM,
+        pixelX: stepLandmark.pixelX,
+        pixelY: stepLandmark.pixelY,
+      };
+
+      if (calibrationStep === 1) {
+        setAnchor1(anchor);
+        setAnchor1LandmarkId(stepLandmark.id);
+        setCalibrationStep(2);
+        setStepLandmark(null);
+        setHighlightedLandmarkId(null);
+      } else if (anchor1) {
+        finishCalibration(anchor1, anchor);
+      }
+    } catch {
+      Alert.alert("Couldn't get a GPS fix", 'Make sure Location Services are enabled for PinPoint and try again.');
+    } finally {
+      setCapturingGps(false);
+    }
+  };
+
+  const handlePinPress = (landmark: Landmark) => {
+    if (calibrating) {
+      handleCalibrationPinSelect(landmark);
+    } else {
+      setActionSheetLandmark(landmark);
+    }
+  };
+
   return (
     <View style={styles.container}>
       <View style={[styles.topBar, { paddingTop: insets.top + 8 }]}>
-        <Pressable onPress={() => navigation.goBack()} hitSlop={10} style={styles.backButton}>
+        <Pressable onPress={() => navigation.goBack()} hitSlop={10} style={styles.sideSlot}>
           <Text style={styles.backText}>‹ Maps</Text>
         </Pressable>
         <Text style={styles.mapName} numberOfLines={1}>
           {map?.name ?? ''}
         </Text>
-        <View style={styles.backButton} />
+        <Pressable onPress={handleCalibrateButtonPress} hitSlop={10} style={[styles.sideSlot, styles.calibrateSlot]} disabled={calibrating}>
+          <Text style={[styles.calibrateText, map?.calibration && styles.calibratedText]}>
+            {map?.calibration ? 'Calibrated ✓' : 'Calibrate'}
+          </Text>
+        </Pressable>
       </View>
 
       {loading || !map ? (
@@ -142,25 +281,37 @@ export default function MapViewScreen() {
             pulseNonce={pulseNonce}
             movingLandmarkId={movingLandmarkId}
             onLongPress={handleLongPress}
-            onPinPress={setActionSheetLandmark}
+            onPinPress={handlePinPress}
             onPinMoved={handlePinMoved}
           />
 
-          <SearchBar query={searchQuery} onChangeQuery={setSearchQuery} results={searchResults} onSelect={handleSearchSelect} />
+          {calibrating ? (
+            <CalibrationWizard
+              step={calibrationStep}
+              selectedLandmark={stepLandmark}
+              capturing={capturingGps}
+              onCapture={handleCapture}
+              onCancel={exitCalibration}
+            />
+          ) : (
+            <>
+              <SearchBar query={searchQuery} onChangeQuery={setSearchQuery} results={searchResults} onSelect={handleSearchSelect} />
 
-          {movingLandmarkId && (
-            <View style={styles.moveBanner}>
-              <Text style={styles.moveBannerText}>Drag the pin to reposition it</Text>
-              <Pressable style={styles.doneButton} onPress={() => setMovingLandmarkId(null)}>
-                <Text style={styles.doneButtonText}>Done</Text>
-              </Pressable>
-            </View>
-          )}
+              {movingLandmarkId && (
+                <View style={styles.moveBanner}>
+                  <Text style={styles.moveBannerText}>Drag the pin to reposition it</Text>
+                  <Pressable style={styles.doneButton} onPress={() => setMovingLandmarkId(null)}>
+                    <Text style={styles.doneButtonText}>Done</Text>
+                  </Pressable>
+                </View>
+              )}
 
-          {map.landmarks.length === 0 && !movingLandmarkId && (
-            <View style={styles.hintBanner} pointerEvents="none">
-              <Text style={styles.hintText}>Long-press anywhere on the map to add a landmark</Text>
-            </View>
+              {map.landmarks.length === 0 && !movingLandmarkId && (
+                <View style={styles.hintBanner} pointerEvents="none">
+                  <Text style={styles.hintText}>Long-press anywhere on the map to add a landmark</Text>
+                </View>
+              )}
+            </>
           )}
         </View>
       )}
@@ -197,9 +348,12 @@ const styles = StyleSheet.create({
     borderBottomColor: '#262a35',
     backgroundColor: '#171a21',
   },
-  backButton: { width: 64 },
+  sideSlot: { minWidth: 64 },
   backText: { color: '#3b82f6', fontSize: 16, fontWeight: '600' },
   mapName: { flex: 1, color: '#e5e7eb', fontSize: 16, fontWeight: '700', textAlign: 'center' },
+  calibrateSlot: { alignItems: 'flex-end' },
+  calibrateText: { color: '#3b82f6', fontSize: 14, fontWeight: '600' },
+  calibratedText: { color: '#4ade80' },
   centered: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   canvasArea: { flex: 1 },
   moveBanner: {
