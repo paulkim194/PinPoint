@@ -7,10 +7,16 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import AddLandmarkModal from '../components/AddLandmarkModal';
 import CalibrationWizard from '../components/CalibrationWizard';
 import MapCanvas, { type MapCanvasHandle } from '../components/MapCanvas';
+import NavigationBanner from '../components/NavigationBanner';
 import PinActionSheet from '../components/PinActionSheet';
 import SearchBar from '../components/SearchBar';
-import { bearingAndDistance } from '../services/geo';
-import { captureAveragedPosition, requestForegroundPermission } from '../services/location';
+import { bearingAndDistance, bearingAndDistanceToPixel, computeTransform, gpsToPixel } from '../services/geo';
+import {
+  captureAveragedPosition,
+  requestForegroundPermission,
+  watchHeading,
+  watchPosition,
+} from '../services/location';
 import { createLandmarkIndex, searchLandmarks } from '../services/search';
 import { storage } from '../services/storage';
 import { generateId } from '../utils/id';
@@ -19,6 +25,7 @@ import type { RootStackParamList } from '../navigation/types';
 
 type Nav = NativeStackNavigationProp<RootStackParamList, 'MapView'>;
 type Rt = RouteProp<RootStackParamList, 'MapView'>;
+type Subscription = { remove: () => void };
 
 type ModalState = { kind: 'add'; pixelX: number; pixelY: number } | { kind: 'edit'; landmark: Landmark } | null;
 
@@ -48,6 +55,13 @@ export default function MapViewScreen() {
   const [anchor1LandmarkId, setAnchor1LandmarkId] = useState<string | null>(null);
   const [capturingGps, setCapturingGps] = useState(false);
 
+  const [tracking, setTracking] = useState(false);
+  const [userFix, setUserFix] = useState<{ lat: number; lng: number; accuracyM: number } | null>(null);
+  const [headingDeg, setHeadingDeg] = useState<number | null>(null);
+  const [navigationTargetId, setNavigationTargetId] = useState<string | null>(null);
+  const locationSubRef = useRef<Subscription | null>(null);
+  const headingSubRef = useRef<Subscription | null>(null);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -62,8 +76,59 @@ export default function MapViewScreen() {
     };
   }, [route.params.mapId]);
 
+  // Starts/stops the GPS + compass watchers whenever `tracking` flips.
+  // Cleanup (on toggle-off or unmount) removes both subscriptions -- this is
+  // the only place that owns their lifecycle.
+  useEffect(() => {
+    if (!tracking) return;
+    let cancelled = false;
+
+    (async () => {
+      const granted = await requestForegroundPermission();
+      if (cancelled) return;
+      if (!granted) {
+        Alert.alert('Location permission needed', 'Enable location access to show your position on the map.');
+        setTracking(false);
+        return;
+      }
+      locationSubRef.current = await watchPosition((fix) => setUserFix(fix));
+      if (cancelled) {
+        locationSubRef.current.remove();
+        locationSubRef.current = null;
+        return;
+      }
+      headingSubRef.current = watchHeading((deg) => setHeadingDeg(deg));
+    })();
+
+    return () => {
+      cancelled = true;
+      locationSubRef.current?.remove();
+      locationSubRef.current = null;
+      headingSubRef.current?.remove();
+      headingSubRef.current = null;
+    };
+  }, [tracking]);
+
   const fuseIndex = useMemo(() => createLandmarkIndex(map?.landmarks ?? []), [map?.landmarks]);
   const searchResults = useMemo(() => searchLandmarks(fuseIndex, searchQuery), [fuseIndex, searchQuery]);
+
+  const transform = useMemo(() => (map?.calibration ? computeTransform(map.calibration) : null), [map?.calibration]);
+
+  const userLocationPixel = useMemo(() => {
+    if (!transform || !userFix) return null;
+    const { x, y } = gpsToPixel(transform, userFix.lat, userFix.lng);
+    return { pixelX: x, pixelY: y, accuracyPixels: userFix.accuracyM / transform.metersPerPixel };
+  }, [transform, userFix]);
+
+  const navigationTarget = useMemo(
+    () => (navigationTargetId ? map?.landmarks.find((l) => l.id === navigationTargetId) ?? null : null),
+    [navigationTargetId, map?.landmarks]
+  );
+
+  const navInfo = useMemo(() => {
+    if (!transform || !userFix || !navigationTarget) return null;
+    return bearingAndDistanceToPixel(transform, userFix.lat, userFix.lng, navigationTarget.pixelX, navigationTarget.pixelY);
+  }, [transform, userFix, navigationTarget]);
 
   const handleLongPress = (pixelX: number, pixelY: number) => {
     if (calibrating) return;
@@ -249,6 +314,37 @@ export default function MapViewScreen() {
     }
   };
 
+  // ---- Live tracking ----
+
+  const handleToggleTracking = () => {
+    if (!map?.calibration) {
+      Alert.alert('Calibrate this map first', 'Showing your live position requires calibrating this map with two GPS anchor points.');
+      return;
+    }
+    if (tracking) {
+      setTracking(false);
+      setUserFix(null);
+      setHeadingDeg(null);
+      setNavigationTargetId(null);
+    } else {
+      setTracking(true);
+    }
+  };
+
+  const handleNavigate = () => {
+    if (!actionSheetLandmark) return;
+    if (!map?.calibration) {
+      Alert.alert('Calibrate this map first', 'Navigation requires calibrating this map with two GPS anchor points.');
+      setActionSheetLandmark(null);
+      return;
+    }
+    setNavigationTargetId(actionSheetLandmark.id);
+    setActionSheetLandmark(null);
+    if (!tracking) setTracking(true);
+  };
+
+  const handleStopNavigating = () => setNavigationTargetId(null);
+
   return (
     <View style={styles.container}>
       <View style={[styles.topBar, { paddingTop: insets.top + 8 }]}>
@@ -280,6 +376,8 @@ export default function MapViewScreen() {
             highlightedLandmarkId={highlightedLandmarkId}
             pulseNonce={pulseNonce}
             movingLandmarkId={movingLandmarkId}
+            userLocation={userLocationPixel}
+            navigationTargetLandmarkId={navigationTargetId}
             onLongPress={handleLongPress}
             onPinPress={handlePinPress}
             onPinMoved={handlePinMoved}
@@ -297,19 +395,42 @@ export default function MapViewScreen() {
             <>
               <SearchBar query={searchQuery} onChangeQuery={setSearchQuery} results={searchResults} onSelect={handleSearchSelect} />
 
-              {movingLandmarkId && (
+              <Pressable
+                style={[
+                  styles.locateButton,
+                  tracking && styles.locateButtonActive,
+                  (movingLandmarkId || navigationTarget) && styles.locateButtonRaised,
+                ]}
+                onPress={handleToggleTracking}
+                hitSlop={8}
+              >
+                <View style={[styles.locateRing, tracking && styles.locateRingActive]}>
+                  <View style={[styles.locateDot, tracking && styles.locateDotActive]} />
+                </View>
+              </Pressable>
+
+              {movingLandmarkId ? (
                 <View style={styles.moveBanner}>
                   <Text style={styles.moveBannerText}>Drag the pin to reposition it</Text>
                   <Pressable style={styles.doneButton} onPress={() => setMovingLandmarkId(null)}>
                     <Text style={styles.doneButtonText}>Done</Text>
                   </Pressable>
                 </View>
-              )}
-
-              {map.landmarks.length === 0 && !movingLandmarkId && (
-                <View style={styles.hintBanner} pointerEvents="none">
-                  <Text style={styles.hintText}>Long-press anywhere on the map to add a landmark</Text>
-                </View>
+              ) : navigationTarget ? (
+                <NavigationBanner
+                  landmarkName={navigationTarget.name}
+                  distanceM={navInfo?.distanceM ?? null}
+                  bearingDeg={navInfo?.bearingDeg ?? null}
+                  headingDeg={headingDeg}
+                  accuracyM={userFix?.accuracyM ?? null}
+                  onStop={handleStopNavigating}
+                />
+              ) : (
+                map.landmarks.length === 0 && (
+                  <View style={styles.hintBanner} pointerEvents="none">
+                    <Text style={styles.hintText}>Long-press anywhere on the map to add a landmark</Text>
+                  </View>
+                )
               )}
             </>
           )}
@@ -330,6 +451,7 @@ export default function MapViewScreen() {
         onRename={handleRename}
         onMove={handleMove}
         onDelete={handleDelete}
+        onNavigate={handleNavigate}
         onClose={() => setActionSheetLandmark(null)}
       />
     </View>
@@ -390,4 +512,23 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     overflow: 'hidden',
   },
+  locateButton: {
+    position: 'absolute',
+    right: 16,
+    bottom: 24,
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    backgroundColor: 'rgba(23,26,33,0.97)',
+    borderWidth: 1,
+    borderColor: '#262a35',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  locateButtonActive: { borderColor: '#3b82f6' },
+  locateButtonRaised: { bottom: 100 },
+  locateRing: { width: 20, height: 20, borderRadius: 10, borderWidth: 2, borderColor: '#8b92a3', alignItems: 'center', justifyContent: 'center' },
+  locateRingActive: { borderColor: '#3b82f6' },
+  locateDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: '#8b92a3' },
+  locateDotActive: { backgroundColor: '#3b82f6' },
 });

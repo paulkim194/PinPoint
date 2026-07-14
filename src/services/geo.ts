@@ -119,3 +119,37 @@ export function bearingAndDistance(from: LatLng, to: LatLng): { bearingDeg: numb
 
   return { bearingDeg, distanceM };
 }
+
+/**
+ * Bearing (compass degrees, clockwise from true north) and distance (meters)
+ * from a live GPS position to a landmark that only has image-pixel
+ * coordinates -- landmarks are never given their own lat/lng, so this skips
+ * an explicit pixel->GPS inverse projection: pixel-space Euclidean distance
+ * already equals real-world distance once divided by the transform's scale
+ * (a similarity transform preserves length ratios uniformly everywhere),
+ * and un-rotating the pixel-space delta by -transform.rotation recovers its
+ * true-north-relative direction. Used for the "Wasteland ↗ 420m" banner.
+ */
+export function bearingAndDistanceToPixel(
+  t: GpsToPixelTransform,
+  userLat: number,
+  userLng: number,
+  targetPixelX: number,
+  targetPixelY: number
+): { bearingDeg: number; distanceM: number } {
+  const userPixel = gpsToPixel(t, userLat, userLng);
+  const dPixX = targetPixelX - userPixel.x;
+  const dPixY = targetPixelY - userPixel.y;
+
+  const cos = Math.cos(t.rotation);
+  const sin = Math.sin(t.rotation);
+  // Inverse-rotate the pixel-space delta back into the local plane's
+  // (east, north) meter space.
+  const dPlaneX = (dPixX * cos + dPixY * sin) / t.scale;
+  const dPlaneY = (-dPixX * sin + dPixY * cos) / t.scale;
+
+  const distanceM = Math.hypot(dPlaneX, dPlaneY);
+  const bearingDeg = (toDegrees(Math.atan2(dPlaneX, dPlaneY)) + 360) % 360;
+
+  return { bearingDeg, distanceM };
+}

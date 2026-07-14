@@ -1,4 +1,4 @@
-import { bearingAndDistance, computeTransform, gpsToPixel } from './geo';
+import { bearingAndDistance, bearingAndDistanceToPixel, computeTransform, gpsToPixel } from './geo';
 import type { Calibration } from '../types';
 
 // 1 degree of latitude, or of longitude at the equator, is ~111,194.93m on
@@ -37,6 +37,12 @@ describe('computeTransform + gpsToPixel: simple east-west (unrotated) map', () =
     // 500m spans 200px, so 2.5m per pixel.
     expect(transform.metersPerPixel).toBeCloseTo(2.5, 5);
   });
+
+  it('bearingAndDistanceToPixel: standing at anchor 1, target at anchor 2 (due east)', () => {
+    const result = bearingAndDistanceToPixel(transform, 0, 0, 300, 100);
+    expect(result.distanceM).toBeCloseTo(500, 5);
+    expect(result.bearingDeg).toBeCloseTo(90, 5);
+  });
 });
 
 describe('computeTransform + gpsToPixel: 90-degree-rotated map', () => {
@@ -72,6 +78,12 @@ describe('computeTransform + gpsToPixel: 90-degree-rotated map', () => {
 
   it('computes the correct meters-per-pixel scale regardless of rotation', () => {
     expect(transform.metersPerPixel).toBeCloseTo(2.5, 5);
+  });
+
+  it('bearingAndDistanceToPixel: standing at anchor 1, target at anchor 2 (due north despite rotation)', () => {
+    const result = bearingAndDistanceToPixel(transform, lat1, lng1, 350, 150);
+    expect(result.distanceM).toBeCloseTo(500, 5);
+    expect(result.bearingDeg).toBeCloseTo(0, 5);
   });
 });
 

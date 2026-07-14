@@ -14,10 +14,20 @@ import type { Landmark } from '../types';
 const MIN_SCALE = 1;
 const MAX_SCALE = 6;
 const SEARCH_FOCUS_SCALE = 2.5;
+const MIN_HALO_RADIUS_PX = 10;
+const MAX_HALO_RADIUS_PX = 150;
 
 export interface MapCanvasHandle {
   /** Animates zoom/pan so the given intrinsic pixel position is centered in the viewport. */
   centerOnPixel: (pixelX: number, pixelY: number) => void;
+}
+
+export interface UserLocationPixel {
+  /** Intrinsic image coordinates, same convention as Landmark.pixelX/pixelY. */
+  pixelX: number;
+  pixelY: number;
+  /** GPS accuracy converted to intrinsic image pixels (accuracyM / metersPerPixel). */
+  accuracyPixels: number;
 }
 
 interface MapCanvasProps {
@@ -28,6 +38,8 @@ interface MapCanvasProps {
   highlightedLandmarkId: string | null;
   pulseNonce: number;
   movingLandmarkId: string | null;
+  userLocation: UserLocationPixel | null;
+  navigationTargetLandmarkId: string | null;
   onLongPress: (pixelX: number, pixelY: number) => void;
   onPinPress: (landmark: Landmark) => void;
   onPinMoved: (landmarkId: string, pixelX: number, pixelY: number) => void;
@@ -42,6 +54,8 @@ function MapCanvas(
     highlightedLandmarkId,
     pulseNonce,
     movingLandmarkId,
+    userLocation,
+    navigationTargetLandmarkId,
     onLongPress,
     onPinPress,
     onPinMoved,
@@ -176,6 +190,10 @@ function MapCanvas(
     [ready, baseScale, baseWidth, baseHeight, viewport.width, viewport.height]
   );
 
+  const navigationTarget = navigationTargetLandmarkId
+    ? landmarks.find((l) => l.id === navigationTargetLandmarkId) ?? null
+    : null;
+
   return (
     <View style={styles.fill} onLayout={handleLayout}>
       {ready && (
@@ -187,6 +205,16 @@ function MapCanvas(
                 style={{ width: baseWidth, height: baseHeight }}
                 resizeMode="stretch"
               />
+
+              {userLocation && navigationTarget && (
+                <GuidanceLine
+                  fromX={userLocation.pixelX * baseScale}
+                  fromY={userLocation.pixelY * baseScale}
+                  toX={navigationTarget.pixelX * baseScale}
+                  toY={navigationTarget.pixelY * baseScale}
+                />
+              )}
+
               {landmarks.map((landmark) => (
                 <PinMarker
                   key={landmark.id}
@@ -200,10 +228,63 @@ function MapCanvas(
                   onMoveEnd={(pixelX, pixelY) => onPinMoved(landmark.id, pixelX, pixelY)}
                 />
               ))}
+
+              {userLocation && (
+                <BlueDot
+                  x={userLocation.pixelX * baseScale}
+                  y={userLocation.pixelY * baseScale}
+                  haloRadius={Math.min(
+                    Math.max(userLocation.accuracyPixels * baseScale, MIN_HALO_RADIUS_PX),
+                    MAX_HALO_RADIUS_PX
+                  )}
+                />
+              )}
             </Animated.View>
           </View>
         </GestureDetector>
       )}
+    </View>
+  );
+}
+
+/** Straight line between two base-display points, drawn as a rotated 2px-thick View. */
+function GuidanceLine({ fromX, fromY, toX, toY }: { fromX: number; fromY: number; toX: number; toY: number }) {
+  const dx = toX - fromX;
+  const dy = toY - fromY;
+  const length = Math.hypot(dx, dy);
+  const angleDeg = (Math.atan2(dy, dx) * 180) / Math.PI;
+  const midX = (fromX + toX) / 2;
+  const midY = (fromY + toY) / 2;
+
+  return (
+    <View
+      pointerEvents="none"
+      style={[
+        styles.guidanceLine,
+        {
+          left: midX - length / 2,
+          top: midY - 1,
+          width: length,
+          // Rotating around the default (center) transform origin is what
+          // makes positioning by midpoint + half-length correct -- no
+          // dependency on transformOrigin support.
+          transform: [{ rotate: `${angleDeg}deg` }],
+        },
+      ]}
+    />
+  );
+}
+
+function BlueDot({ x, y, haloRadius }: { x: number; y: number; haloRadius: number }) {
+  return (
+    <View pointerEvents="none" style={{ position: 'absolute', left: x, top: y }}>
+      <View
+        style={[
+          styles.halo,
+          { width: haloRadius * 2, height: haloRadius * 2, borderRadius: haloRadius, left: -haloRadius, top: -haloRadius },
+        ]}
+      />
+      <View style={styles.dot} />
     </View>
   );
 }
@@ -213,4 +294,17 @@ export default forwardRef(MapCanvas);
 const styles = StyleSheet.create({
   fill: { flex: 1, overflow: 'hidden', backgroundColor: '#000' },
   transformer: { position: 'absolute', left: 0, top: 0 },
+  guidanceLine: { position: 'absolute', height: 2, backgroundColor: 'rgba(59,130,246,0.55)' },
+  halo: { position: 'absolute', backgroundColor: 'rgba(59,130,246,0.18)', borderWidth: 1, borderColor: 'rgba(59,130,246,0.4)' },
+  dot: {
+    position: 'absolute',
+    width: 16,
+    height: 16,
+    borderRadius: 8,
+    left: -8,
+    top: -8,
+    backgroundColor: '#3b82f6',
+    borderWidth: 2,
+    borderColor: '#ffffff',
+  },
 });

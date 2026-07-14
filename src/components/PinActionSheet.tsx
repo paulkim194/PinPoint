@@ -7,10 +7,11 @@ interface PinActionSheetProps {
   onRename: () => void;
   onMove: () => void;
   onDelete: () => void;
+  onNavigate: () => void;
   onClose: () => void;
 }
 
-export default function PinActionSheet({ landmark, onRename, onMove, onDelete, onClose }: PinActionSheetProps) {
+export default function PinActionSheet({ landmark, onRename, onMove, onDelete, onNavigate, onClose }: PinActionSheetProps) {
   return (
     <Modal visible={!!landmark} transparent animationType="slide" onRequestClose={onClose}>
       <Pressable style={styles.backdrop} onPress={onClose}>
@@ -19,6 +20,9 @@ export default function PinActionSheet({ landmark, onRename, onMove, onDelete, o
             {landmark?.name}
           </Text>
 
+          <Pressable style={styles.row} onPress={onNavigate}>
+            <Text style={styles.rowText}>Navigate here</Text>
+          </Pressable>
           <Pressable style={styles.row} onPress={onRename}>
             <Text style={styles.rowText}>Rename</Text>
           </Pressable>

@@ -7,7 +7,10 @@
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSMotionUsageDescription": "PinPoint uses the compass to point you toward a landmark while navigating."
+      }
     },
     "android": {
       "adaptiveIcon": {
